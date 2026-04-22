@@ -314,3 +314,202 @@ ORDER BY active_parts DESC;
 ---
 
 *다음 장: 7장. Primary Index — Sparse Index의 원리와 ORDER BY 키 설계*
+
+---
+
+## 6.13 시각적 이해 — 고객 행동 데이터로 보는 머지 전 과정
+
+### 테이블 설정
+
+```sql
+CREATE TABLE user_events (
+    event_time  DateTime,
+    user_id     UInt64,
+    event_type  LowCardinality(String),
+    page        LowCardinality(String),
+    amount      UInt32
+)
+ENGINE = MergeTree
+ORDER BY (event_type, toDate(event_time), user_id);
+```
+
+### Step 1 — INSERT 3번 → 파트 3개 생성
+
+```
+오전 9:00 INSERT 500만 건 →  all_0_0_0  (level 0)
+오전 9:01 INSERT 500만 건 →  all_1_1_0  (level 0)
+오전 9:02 INSERT 500만 건 →  all_2_2_0  (level 0)
+
+디스크:
+  user_events/
+    all_0_0_0/
+      event_type.bin, user_id.bin, amount.bin
+      primary.idx, *.mrk
+    all_1_1_0/
+      event_type.bin, user_id.bin, amount.bin
+      primary.idx, *.mrk
+    all_2_2_0/
+      ...
+```
+
+이 시점에 SELECT 하면 파트 3개를 모두 열어서 읽는다.
+
+### Step 2 — 백그라운드 머지 4단계
+
+```
+① 압축 해제 & 로드
+   all_0_0_0, all_1_1_0, all_2_2_0 의 .bin 파일을 메모리에 올림
+
+② Merge Sort (정렬 순서 유지하며 합침)
+
+   Part A: [click/2024-01-01/user_111, click/2024-01-01/user_999, ...]
+   Part B: [click/2024-01-01/user_333, view/2024-01-01/user_222, ...]
+   Part C: [click/2024-01-01/user_555, purchase/2024-01-02/user_777, ...]
+                               ↓
+   Merged: [click/2024-01-01/user_111,
+            click/2024-01-01/user_333,
+            click/2024-01-01/user_555,
+            click/2024-01-01/user_999,
+            purchase/2024-01-02/user_777,
+            view/2024-01-01/user_222, ...]
+
+③ 새 sparse primary index 생성 (8,192행마다 1개 엔트리)
+
+④ 압축 & 저장 → all_0_2_1 (level=1) 생성
+```
+
+### Step 3 — 원본 파트 정리
+
+```
+all_0_2_1 생성 완료
+  → all_0_0_0, all_1_1_0, all_2_2_0 → inactive 마킹
+  → 8분 후 디스크 삭제 (old_parts_lifetime 기본값)
+
+최종 디스크:
+  user_events/
+    all_0_2_1/   ← 3개가 1개로 수렴 (level 1)
+      event_type.bin, user_id.bin, amount.bin
+      primary.idx, *.mrk
+```
+
+### 시간에 따른 레벨 계층 형성
+
+```
+[오전 9시 ~ 12시 INSERT 계속]
+
+  level 0 파트 수십 개  ←─ INSERT 직후
+       ↓ 백그라운드 머지
+  level 1 파트 몇 개
+       ↓
+  level 2 파트 1~2개
+       ↓
+  all_0_999_3  ← 결국 1개로 수렴 (파티셔닝 없는 경우)
+
+system.parts 실제 스냅샷 예:
+  all_0_5_1     level=1  rows=6,368,414   ← 최근 INSERT, 머지 진행 중
+  all_6_11_1    level=1  rows=6,442,494
+  all_0_23_2    level=2  rows=25,248,433  ← 오래된 데이터, 이미 수렴
+```
+
+### 엔진별 머지 시 다른 점
+
+```
+MergeTree (기본): 정렬 순서 유지하며 그냥 합침
+  user_123 click  9:00  ← Part A
+  user_123 click  9:01  ← Part B
+            ↓ merge
+  user_123 click  9:00  (둘 다 유지, 중복 허용)
+  user_123 click  9:01
+
+ReplacingMergeTree: 같은 키 중 최신만 유지
+  user_123 grade=Bronze ver=1  ← Part A
+  user_123 grade=Gold   ver=2  ← Part B
+            ↓ merge
+  user_123 grade=Gold   ver=2  (최신 ver만 살아남음)
+
+SummingMergeTree: 같은 키의 숫자 컬럼 합산
+  user_123 purchase_count=3 amount=15000  ← Part A
+  user_123 purchase_count=2 amount= 8000  ← Part B
+            ↓ merge
+  user_123 purchase_count=5 amount=23000
+```
+
+---
+
+## 6.14 시각적 이해 — FINAL 키워드가 느린 이유
+
+### 문제 상황
+
+```sql
+CREATE TABLE user_grade (
+    user_id UInt64,
+    grade   String,
+    ver     UInt64
+)
+ENGINE = ReplacingMergeTree(ver)
+ORDER BY user_id;
+```
+
+```
+오전: INSERT user_123 grade=Bronze ver=1  →  파트 A
+낮:   INSERT user_123 grade=Gold   ver=2  →  파트 B
+백그라운드 머지 아직 안 됨
+```
+
+```sql
+-- 머지 전 SELECT 결과: 중복 2개
+SELECT * FROM user_grade WHERE user_id = 123;
+  user_123  Bronze  ver=1  ← 파트 A
+  user_123  Gold    ver=2  ← 파트 B  (올바른 최신값)
+
+-- FINAL 사용 시: 올바른 결과
+SELECT * FROM user_grade FINAL WHERE user_id = 123;
+  user_123  Gold    ver=2
+```
+
+### FINAL이 느린 이유 3가지
+
+**이유 1 — 병렬 처리가 깨진다**
+
+```
+FINAL 없이:
+  파트 A → 스레드 1  ┐
+  파트 B → 스레드 2  ├── 완전 병렬, 각자 읽음
+  파트 C → 스레드 3  ┘
+
+FINAL 있으면:
+  파트 A, B, C 전부 읽은 후
+  같은 user_id끼리 ver 비교/정렬 → 단일 스레드 구간 발생
+```
+
+**이유 2 — 더 많은 데이터를 읽는다**
+
+```
+WHERE user_id = 123 이어도:
+  FINAL 없이: primary index로 해당 granule만 읽음
+  FINAL 있으면: user_id=123이 어느 파트에 있는지
+               전체 파트를 더 넓게 스캔해야 함
+```
+
+**이유 3 — 메모리에서 머지 로직 실행 = 추가 CPU + 메모리**
+
+```
+파트가 100개 → 100개 읽고 메모리에서 정렬/비교
+파트가 1개   → 이미 머지 완료 → FINAL이 할 일 없음
+
+∴ 파트 수가 많을수록 FINAL 성능 저하 심각
+```
+
+### FINAL 대신 쓰는 패턴
+
+```sql
+-- argMax: ver이 최대인 행의 grade 반환
+SELECT
+    user_id,
+    argMax(grade, ver) AS latest_grade
+FROM user_grade
+WHERE user_id = 123
+GROUP BY user_id;
+
+-- 병렬 실행 유지됨, FINAL보다 빠름
+```
