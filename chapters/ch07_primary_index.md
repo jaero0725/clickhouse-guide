@@ -353,3 +353,141 @@ ALTER TABLE mytable ADD INDEX idx_name col_name TYPE minmax GRANULARITY 4;
 ---
 
 *다음 장: 8장. Shards와 Replicas — 분산 아키텍처*
+
+---
+
+## 7.11 시각적 이해 — ORDER BY 키 설계가 성능에 미치는 영향
+
+동일 데이터, 동일 쿼리에서 ORDER BY 키 순서에 따른 차이.
+
+### 시나리오: 로그인 이벤트 테이블
+
+```
+저카디널리티: status (약 4개), country (약 200개)
+고카디널리티: user_id (수백만), event_time (수억 유니크)
+
+주요 쿼리: WHERE status = 'failed' AND event_time >= '...'
+```
+
+### 설계 A — 고카디널리티 먼저 (나쁨)
+
+```sql
+ORDER BY (user_id, event_time, status, country)
+```
+
+```
+파트 내부 레이아웃:
+ user_id=1,       event_time=09:00, status=ok,   country=KR
+ user_id=1,       event_time=09:01, status=ok,   country=KR
+  ...
+ user_id=2,       event_time=09:00, status=fail, country=US
+  ...
+ user_id=1000000, event_time=23:59, status=ok,   country=JP
+
+WHERE status = 'failed' AND event_time >= '...'
+  → user_id 필터 없으면 인덱스 이진 탐색 활용 불가
+  → 전체 파트 스캔 (풀 스캔)
+```
+
+### 설계 B — 저카디널리티 먼저 (좋음)
+
+```sql
+ORDER BY (status, toDate(event_time), country, user_id)
+```
+
+```
+파트 내부 레이아웃:
+ status=fail, date=2024-04-01, country=JP, user_id=...
+  (수만 건)
+ status=fail, date=2024-04-02, country=KR, user_id=...
+  (수만 건)   ← 쿼리가 요구하는 범위
+ status=ok,   date=2024-04-01, country=JP, user_id=...
+  (수억 건)   ← 인덱스로 바로 skip
+ status=ok,   date=2024-04-30, country=US, user_id=...
+
+WHERE status = 'failed' AND event_time >= '2024-04-01'
+  → 인덱스 이진 탐색으로 status=fail 구간에 점프
+  → 날짜 조건으로 추가 granule 필터링
+  → 실제로 읽는 데이터 1% 미만
+```
+
+### 실측 비교
+
+| 지표 | 설계 A | 설계 B |
+|------|--------|--------|
+| 스캔 granule | 3,609 / 3,609 (100%) | 3 / 3,609 (0.08%) |
+| 읽은 행 | 2,950만 | 24,580 |
+| 소요 시간 | 8,500ms | 10ms |
+
+**850배 차이.** 단지 키 순서만 바꿨을 뿐.
+
+---
+
+## 7.12 시각적 이해 — Granule Skip의 원리
+
+```sql
+CREATE TABLE events (...)
+ORDER BY (status, date);
+```
+
+INSERT 후 디스크 레이아웃:
+
+```
+granule 0 [0 ~ 8191]:     status=fail, date=2024-04-01 ~ 2024-04-03
+granule 1 [8192 ~ 16383]: status=fail, date=2024-04-04 ~ 2024-04-08
+granule 2 [16384 ~ ...]:  status=ok,   date=2024-04-01 ~ 2024-04-02
+granule 3:                status=ok,   date=2024-04-03 ~ 2024-04-05
+granule 4:                status=ok,   date=2024-04-06 ~ 2024-04-09
+...
+
+primary.idx (각 granule의 첫 행 키 저장):
+[0]: (fail, 2024-04-01)
+[1]: (fail, 2024-04-04)
+[2]: (ok,   2024-04-01)
+[3]: (ok,   2024-04-03)
+[4]: (ok,   2024-04-06)
+```
+
+### 쿼리 실행 시
+
+```sql
+SELECT count() FROM events 
+WHERE status = 'ok' AND date >= '2024-04-03' AND date <= '2024-04-07';
+```
+
+```
+1. primary.idx를 이진 탐색
+
+2. 조건 매칭:
+   granule 0 (fail): status 불일치 → skip
+   granule 1 (fail): status 불일치 → skip
+   granule 2 (ok, 2024-04-01~02): date 조건 미포함 → skip
+   granule 3 (ok, 2024-04-03~05): 겹침! → 읽기
+   granule 4 (ok, 2024-04-06~09): 겹침! → 읽기
+
+3. 선택된 granule만 디스크에서 읽기
+   → 원본 데이터의 일부만 I/O 발생
+```
+
+### "인덱스가 안 먹히는" 패턴
+
+```sql
+-- 나쁨: 키의 앞부분(status)을 안 쓰고 date만 필터
+WHERE date = '2024-04-05'
+  → status 값이 섞여 있어 granule skip 힘듦
+
+-- 나쁨: 함수 래핑 (일부는 작동, 복잡한 건 안 됨)
+WHERE transform(status) = 'failed'
+  → 최적화기가 인덱스 못 씀
+
+-- 나쁨: 부정 조건
+WHERE status != 'ok'
+  → 대부분 granule이 매칭 → skip 효과 없음
+
+-- 좋음: 키 순서대로 필터
+WHERE status = 'failed' AND date >= '...'
+
+-- 좋음: IN 절
+WHERE status IN ('failed', 'timeout')
+  → 여러 범위를 각각 이진 탐색
+```
