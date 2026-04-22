@@ -116,6 +116,7 @@ cheatsheets/troubleshooting_queries.md
 | [type_selection.md](cheatsheets/type_selection.md) | 타입 선택 가이드, 압축 코덱 |
 | [insert_strategy_flowchart.md](cheatsheets/insert_strategy_flowchart.md) | INSERT 전략 의사결정 트리 |
 | [troubleshooting_queries.md](cheatsheets/troubleshooting_queries.md) | 증상별 진단 쿼리 모음 |
+| [version_history.md](cheatsheets/version_history.md) | 버전별 주요 변경사항 (23.x ~ 25.x), LTS 선택 가이드 |
 
 ---
 
