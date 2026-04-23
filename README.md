@@ -11,7 +11,8 @@
 clickhouse-guide/
 ├── chapters/        ← 개념 학습 (1~11장)
 ├── examples/        ← 실무 도메인 예제 (E-commerce, IoT 등)
-└── cheatsheets/     ← 빠른 참조 (엔진, 타입, 트러블슈팅)
+├── troubleshooting/ ← 실수 케이스 스터디 (12개 케이스)
+└── cheatsheets/     ← 빠른 참조 (엔진, 타입, 버전 등)
 ```
 
 ---
@@ -103,6 +104,40 @@ cheatsheets/troubleshooting_queries.md
 | [03](examples/03_iot_sensors.md) | 🌡️ **IoT 시계열** | DoubleDelta/Gorilla 코덱, 다단계 집계 |
 | [04](examples/04_user_behavior_analytics.md) | 📈 **Product Analytics** | HyperLogLog, Funnel, Retention |
 | [05](examples/05_ad_events.md) | 💰 **광고 이벤트** | Collapsing, 샘플링, 부정 클릭 탐지 |
+
+---
+
+## 🔥 troubleshooting — 케이스 스터디
+
+실수 상황별 증상 → 원인 → 진단 → 해결 과정을 따라가는 케이스 스터디.
+
+### A. 파티셔닝 실수
+| 케이스 | 핵심 증상 |
+|--------|---------|
+| [A1. 일 단위 파티셔닝](troubleshooting/A1_daily_partition_explosion.md) | Too many parts, INSERT 중단 |
+| [A2. 고카디널리티 파티셔닝](troubleshooting/A2_high_cardinality_partition.md) | 파티션 수만 개, 서버 시작 수분 |
+
+### B. 엔진 오용
+| 케이스 | 핵심 증상 |
+|--------|---------|
+| [B1. ReplacingMergeTree + FINAL 누락](troubleshooting/B1_replacing_without_final.md) | 중복 행, 집계값 2배 |
+| [B2. CollapsingMergeTree sign 꼬임](troubleshooting/B2_collapsing_sign_order.md) | 잔액/수량 음수 또는 소실 |
+| [B3. SummingMergeTree String 컬럼](troubleshooting/B3_summing_string_columns.md) | 머지 후 문자열 값 임의 변경 |
+
+### C. 쿼리 실수
+| 케이스 | 핵심 증상 |
+|--------|---------|
+| [C1. SELECT * 남용](troubleshooting/C1_select_star.md) | 쿼리가 예상보다 10~100배 느림 |
+| [C2. FINAL 남발](troubleshooting/C2_final_overuse.md) | 싱글 스레드 실행, CPU 폭증 |
+| [C3. Distributed GROUP BY OOM](troubleshooting/C3_distributed_group_by_oom.md) | Memory limit exceeded |
+| [C4. DISTINCT vs uniq](troubleshooting/C4_distinct_vs_uniq.md) | DAU 쿼리 10초 이상, 메모리 GB |
+
+### D. 애플리케이션 실수
+| 케이스 | 핵심 증상 |
+|--------|---------|
+| [D1. 건당 INSERT](troubleshooting/D1_per_row_insert.md) | Too many parts, DB 응답 불가 |
+| [D2. Distributed 테이블에 INSERT](troubleshooting/D2_distributed_insert.md) | 쓰기 지연, 이중 네트워크 홉 |
+| [D3. Mutation 남발](troubleshooting/D3_mutation_overuse.md) | 백그라운드 머지 중단, 디스크 2배 |
 
 ---
 
